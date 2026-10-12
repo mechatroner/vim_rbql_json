@@ -29,7 +29,7 @@ function! s:EnsureJavaScriptInitialization()
 endfunction
 
 
-func! rainbow_csv#parse_report(report_content)
+func! vim_rbql_json#parse_report(report_content)
     let lines = split(a:report_content, '\r\?\n')
     let psv_warning_report = ''
     let psv_error_report = ''
@@ -68,7 +68,7 @@ function! s:EnsurePythonInitialization()
         exe 'python3 sys.path.insert(0, "' . py_home_dir . '")'
         py3 import vim_rbql
     else
-        call rainbow_csv#find_python_interpreter()
+        call vim_rbql_json#find_python_interpreter()
         if s:system_python_interpreter == ""
             return 0
         endif
@@ -78,7 +78,7 @@ function! s:EnsurePythonInitialization()
 endfunction
 
 
-func! rainbow_csv#find_python_interpreter()
+func! vim_rbql_json#find_python_interpreter()
     " Checking `python3` first, because `python` could be theorethically linked to python 2.6
     let py3_version = tolower(system('python3 --version'))
     if (v:shell_error == 0 && match(py3_version, 'python 3\.') == 0)
@@ -162,13 +162,13 @@ func! s:converged_select(table_buf_number, rb_script_path, query_buf_nr)
         let cmd_args = ['node', shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), rbql_encoding, shellescape(input_delim), input_policy, shellescape(input_comment_prefix), shellescape(out_delim), out_policy, with_headers_py_tf, trim_spaces]
         let cmd = join(cmd_args, ' ')
         let report_content = system(cmd)
-        let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = rainbow_csv#parse_report(report_content)
+        let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = vim_rbql_json#parse_report(report_content)
     elseif s:system_python_interpreter != ""
         let rbql_executable_path = s:script_folder_path . '/rbql_core/vim_rbql.py'
         let cmd_args = [s:system_python_interpreter, shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), rbql_encoding, shellescape(input_delim), input_policy, shellescape(input_comment_prefix), shellescape(out_delim), out_policy, with_headers_py_tf, trim_spaces]
         let cmd = join(cmd_args, ' ')
         let report_content = system(cmd)
-        let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = rainbow_csv#parse_report(report_content)
+        let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = vim_rbql_json#parse_report(report_content)
     elseif has("python3")
         exe 'python3 ' . py_call
     else
@@ -212,9 +212,9 @@ func! s:run_cmd_query(query)
 endfunction
 
 
-func! rainbow_csv#run_select_cmd_query(query_string)
+func! vim_rbql_json#run_select_cmd_query(query_string)
     let query = 'SELECT ' . a:query_string
-    echomsg query
+    echomsg 'In vim rbql json: ' . query
     " FIXME
     "call s:run_cmd_query(query)
 endfunction
