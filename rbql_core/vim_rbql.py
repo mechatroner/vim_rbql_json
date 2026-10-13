@@ -81,6 +81,7 @@ def converged_execute(src_table_path, rb_script_path, pretty_print):
         table_name = os.path.basename(src_table_path)
         dst_table_name = '{}.txt'.format(table_name)
         dst_table_path = os.path.join(tmp_dir, dst_table_name)
+        vim_interface.set_vim_variable('psv_dst_table_path', dst_table_path)
         execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print)
         logging.info('Completed. Results are in {}'.format(dst_table_path))
     except Exception as e:
