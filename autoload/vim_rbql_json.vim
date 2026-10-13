@@ -6,6 +6,10 @@
 "==============================================================================
 
 let s:rb_storage_dir = exists('g:rb_storage_dir') ? g:rb_storage_dir : $HOME . '/.rainbow_csv_storage'
+" Can be 0 or 1
+let s:rb_pretty_print = exists('g:rb_json_pretty') ? g:rb_json_pretty : 0
+let s:script_folder_path = expand('<sfile>:p:h:h')
+let s:python_env_initialized = 0
 
 
 function! s:py_source_escape(src)
@@ -79,15 +83,9 @@ endfunction
 
 
 func! vim_rbql_json#find_python_interpreter()
-    " Checking `python3` first, because `python` could be theorethically linked to python 2.6
     let py3_version = tolower(system('python3 --version'))
     if (v:shell_error == 0 && match(py3_version, 'python 3\.') == 0)
         let s:system_python_interpreter = 'python3'
-        return s:system_python_interpreter
-    endif
-    let py_version = tolower(system('python --version'))
-    if (v:shell_error == 0 && (match(py_version, 'python 2\.7') == 0 || match(py_version, 'python 3\.') == 0))
-        let s:system_python_interpreter = 'python'
         return s:system_python_interpreter
     endif
     let s:system_python_interpreter = ''
@@ -147,6 +145,8 @@ func! s:converged_select(table_buf_number, rb_script_path, query_buf_nr)
         let table_path = s:rb_storage_dir . "/" . tmp_file_name
         execute "w " . table_path
     endif
+    let table_path_esc = s:py_source_escape(table_path)
+    let rb_script_path_esc = s:py_source_escape(a:rb_script_path)
 
     let psv_query_status = 'Unknown error'
     let psv_error_report = 'Something went wrong'
@@ -155,17 +155,16 @@ func! s:converged_select(table_buf_number, rb_script_path, query_buf_nr)
 
     redraw!
     echo "executing..."
-    let trim_spaces = s:get_rbql_trim_spaces() ? 'True' : 'False'
-    let py_call = 'vim_rbql.run_execute("' . table_path_esc . '", "' . rb_script_path_esc . '", "' . rbql_encoding . '", "' . input_delim_escaped . '", "' . input_policy . '", "' . comment_prefix_escaped . '", "' . out_delim_escaped . '", "' . out_policy . '", ' . with_headers_py_tf . ', ' . trim_spaces . ')'
+    let py_call = 'vim_rbql.run_execute("' . table_path_esc . '", "' . rb_script_path_esc . '", ' . s:rb_pretty_print . ')'
     if meta_language == "js"
         let rbql_executable_path = s:script_folder_path . '/rbql_core/vim_rbql.js'
-        let cmd_args = ['node', shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), rbql_encoding, shellescape(input_delim), input_policy, shellescape(input_comment_prefix), shellescape(out_delim), out_policy, with_headers_py_tf, trim_spaces]
+        let cmd_args = ['node', shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), shellescape(s:rb_pretty_print)]
         let cmd = join(cmd_args, ' ')
         let report_content = system(cmd)
         let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = vim_rbql_json#parse_report(report_content)
     elseif s:system_python_interpreter != ""
         let rbql_executable_path = s:script_folder_path . '/rbql_core/vim_rbql.py'
-        let cmd_args = [s:system_python_interpreter, shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), rbql_encoding, shellescape(input_delim), input_policy, shellescape(input_comment_prefix), shellescape(out_delim), out_policy, with_headers_py_tf, trim_spaces]
+        let cmd_args = [s:system_python_interpreter, shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), shellescape(s:rb_pretty_print)]
         let cmd = join(cmd_args, ' ')
         let report_content = system(cmd)
         let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = vim_rbql_json#parse_report(report_content)
@@ -214,7 +213,6 @@ endfunction
 
 func! vim_rbql_json#run_select_cmd_query(query_string)
     let query = 'SELECT ' . a:query_string
-    echomsg 'In vim rbql json: ' . query
-    " FIXME
-    "call s:run_cmd_query(query)
+    "echomsg 'In vim rbql json: ' . query
+    call s:run_cmd_query(query)
 endfunction
