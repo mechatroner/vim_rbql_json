@@ -5,6 +5,7 @@ import traceback
 import subprocess
 import tempfile
 import time
+import logging
 
 import rbql
 from rbql import rbql_json
@@ -55,6 +56,7 @@ def get_random_suffix():
 
 def execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print):
     query = codecs.open(rb_script_path, encoding='utf-8').read()
+    logging.info('Starting query: "{}"'.format(query))
     warnings = []
     try:
         rbql.query_json(query, src_table_path, dst_table_path, warnings)
@@ -67,13 +69,22 @@ def execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print)
 
 
 def converged_execute(src_table_path, rb_script_path, pretty_print):
+    log_path = os.environ.get("VIM_RBQL_DEBUG_LOG_PATH")
+
+    if log_path:
+        logging.basicConfig(filename=log_path, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    else:
+        logging.getLogger().addHandler(logging.NullHandler())
+
     try:
         tmp_dir = tempfile.gettempdir()
         table_name = os.path.basename(src_table_path)
         dst_table_name = '{}.txt'.format(table_name)
         dst_table_path = os.path.join(tmp_dir, dst_table_name)
         execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print)
+        logging.info('Completed. Results are in {}'.format(dst_table_path))
     except Exception as e:
+        logging.error('Failed query: "{}"'.format(e))
         vim_interface.report_error_to_vim('Execution Error', str(e))
 
 
