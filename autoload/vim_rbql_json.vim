@@ -133,6 +133,12 @@ func! s:converged_select(table_buf_number, rb_script_path, query_buf_nr)
         return 0
     endif
 
+    if meta_language == "js"
+        " TODO Support JS
+        echoerr "This is an experimental plugin so JS mode is currently not supported but it is easy to add it."
+        return 0
+    endif
+
     if meta_language == "js" && !s:EnsureJavaScriptInitialization()
         echoerr "Node.js interpreter not found. Unable to run in this mode."
         return 0
@@ -194,6 +200,8 @@ func! s:converged_select(table_buf_number, rb_script_path, query_buf_nr)
     let b:root_table_name = fnamemodify(table_path, ":t")
     let b:self_buf_number = bufnr("%")
     call setbufvar(a:table_buf_number, 'selected_buf', b:self_buf_number)
+    set ft=json
+
 
     if len(psv_warning_report)
         let warnings = split(psv_warning_report, "\n")
