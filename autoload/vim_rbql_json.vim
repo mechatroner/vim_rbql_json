@@ -6,11 +6,13 @@
 "==============================================================================
 
 let s:rb_storage_dir = exists('g:rb_storage_dir') ? g:rb_storage_dir : $HOME . '/.rainbow_csv_storage'
-" Can be 0 or 1
-let s:rb_pretty_print = exists('g:rb_json_pretty') ? g:rb_json_pretty : 0
 let s:script_folder_path = expand('<sfile>:p:h:h')
 let s:python_env_initialized = 0
 
+func! s:get_pretty_indent()
+    " g:rb_json_pretty_indent must be an integer.
+    return exists('g:rb_json_pretty_indent') ? g:rb_json_pretty_indent : 0
+endfunc
 
 function! s:py_source_escape(src)
     " Strings in 'substitute' must follow esoteric rules, see `:help substitute()`
@@ -152,19 +154,20 @@ func! s:converged_select(table_buf_number, rb_script_path, query_buf_nr)
     let psv_error_report = 'Something went wrong'
     let psv_warning_report = ''
     let psv_dst_table_path = ''
+    let pretty_indent = s:get_pretty_indent()
 
     redraw!
     echo "executing..."
-    let py_call = 'vim_rbql.run_execute("' . table_path_esc . '", "' . rb_script_path_esc . '", ' . s:rb_pretty_print . ')'
+    let py_call = 'vim_rbql.run_execute("' . table_path_esc . '", "' . rb_script_path_esc . '", ' . pretty_indent . ')'
     if meta_language == "js"
         let rbql_executable_path = s:script_folder_path . '/rbql_core/vim_rbql.js'
-        let cmd_args = ['node', shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), shellescape(s:rb_pretty_print)]
+        let cmd_args = ['node', shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), shellescape(pretty_indent)]
         let cmd = join(cmd_args, ' ')
         let report_content = system(cmd)
         let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = vim_rbql_json#parse_report(report_content)
     elseif s:system_python_interpreter != ""
         let rbql_executable_path = s:script_folder_path . '/rbql_core/vim_rbql.py'
-        let cmd_args = [s:system_python_interpreter, shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), shellescape(s:rb_pretty_print)]
+        let cmd_args = [s:system_python_interpreter, shellescape(rbql_executable_path), shellescape(table_path), shellescape(a:rb_script_path), shellescape(pretty_indent)]
         let cmd = join(cmd_args, ' ')
         let report_content = system(cmd)
         let [psv_query_status, psv_error_report, psv_warning_report, psv_dst_table_path] = vim_rbql_json#parse_report(report_content)

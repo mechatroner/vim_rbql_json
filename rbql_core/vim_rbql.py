@@ -54,12 +54,12 @@ def get_random_suffix():
     return str(time.time()).split('.')[0]
 
 
-def execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print):
+def execute_python(src_table_path, rb_script_path, dst_table_path, pretty_indent):
     query = codecs.open(rb_script_path, encoding='utf-8').read()
     logging.info('Starting query: "{}"'.format(query))
     warnings = []
     try:
-        rbql.query_json(query, src_table_path, dst_table_path, warnings)
+        rbql.query_json(query, src_table_path, dst_table_path, warnings, pretty_indent=pretty_indent, input_json_lines=False, output_json_lines=False, input_json_stream=True, output_json_stream=True)
         warning_report = '\n'.join(warnings)
         vim_interface.set_vim_variable('psv_warning_report', warning_report)
         vim_interface.set_vim_variable('psv_query_status', 'OK')
@@ -68,7 +68,8 @@ def execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print)
         vim_interface.report_error_to_vim(error_type, error_msg)
 
 
-def converged_execute(src_table_path, rb_script_path, pretty_print):
+
+def converged_execute(src_table_path, rb_script_path, pretty_indent):
     log_path = os.environ.get("VIM_RBQL_DEBUG_LOG_PATH")
 
     if log_path:
@@ -82,23 +83,27 @@ def converged_execute(src_table_path, rb_script_path, pretty_print):
         dst_table_name = '{}.txt'.format(table_name)
         dst_table_path = os.path.join(tmp_dir, dst_table_name)
         vim_interface.set_vim_variable('psv_dst_table_path', dst_table_path)
-        execute_python(src_table_path, rb_script_path, dst_table_path, pretty_print)
+        pretty_indent = int(pretty_indent)
+        assert pretty_indent <= 12 # Sanity check
+        if not pretty_indent:
+            pretty_indent = None
+        execute_python(src_table_path, rb_script_path, dst_table_path, pretty_indent)
         logging.info('Completed. Results are in {}'.format(dst_table_path))
     except Exception as e:
         logging.error('Failed query: "{}"'.format(e))
         vim_interface.report_error_to_vim('Execution Error', str(e))
 
 
-def run_execute(src_table_path, rb_script_path, pretty_print):
+def run_execute(src_table_path, rb_script_path, pretty_indent):
     global vim_interface
     vim_interface = VimInterface()
-    converged_execute(src_table_path, rb_script_path, pretty_print)
+    converged_execute(src_table_path, rb_script_path, pretty_indent)
 
 
-def run_execute_cli(src_table_path, rb_script_path, pretty_print):
+def run_execute_cli(src_table_path, rb_script_path, pretty_indent):
     global vim_interface
     vim_interface = CLIVimMediator()
-    converged_execute(src_table_path, rb_script_path, pretty_print)
+    converged_execute(src_table_path, rb_script_path, pretty_indent)
     vim_interface.save_report(sys.stdout)
 
 
@@ -107,10 +112,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('input_table_path', metavar='FILE', help='Read csv table from FILE')
     parser.add_argument('query_file', metavar='FILE', help='Read rbql query from FILE')
-    parser.add_argument('pretty_print', metavar='BOOL', help='Pretty print')
+    parser.add_argument('pretty_indent', metavar='INT', help='Pretty indent')
     args = parser.parse_args()
 
-    run_execute_cli(args.input_table_path, args.query_file, args.pretty_print)
+    run_execute_cli(args.input_table_path, args.query_file, args.pretty_indent)
 
 
 if __name__ == '__main__':
