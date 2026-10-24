@@ -5,13 +5,180 @@ const util = require('util');
 
 const rbql = require('./rbql.js');
 const csv_utils = require('./csv_utils.js');
-const json_utils = require('./json_utils.js');
+
+
+const backslashChar = '\\';
+
+class RbqlJsonParsingError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'RbqlJsonParsingError';
+    }
+}
+
+class UnparsedJsonBlob {
+    constructor() {
+        this.bracket_stack = [];
+        this.inside_string = false;
+        this.backslash_escape_flag = false;
+    }
+}
+
+class BalancingIterator {
+    constructor(unwrap_mode = false) {
+        this.buf = '';
+        this.unwrap_mode = unwrap_mode;
+        this.parsed_objects = []; // There is no deque in JS so we use an array. Therefore `advance()` takes O(N).
+        this.current = new UnparsedJsonBlob();
+        this.open_bracket_skipped = this.unwrap_mode ? false : true;
+        this.closing_bracket_skipped = false;
+        this.num_parsed = 0;
+    }
+
+    add_fragment(fragment) {
+        const seek_start_pos = this.buf.length;
+        this.buf += fragment;
+        this._parse_forward(seek_start_pos);
+    }
+
+    get_current_object() {
+        return this.parsed_objects[0];
+    }
+
+    advance() {
+        return this.parsed_objects.shift(); // Equivalent to popleft(), but O(N)
+    }
+
+    empty() {
+        return this.parsed_objects.length === 0;
+    }
+
+    has_trailing_data() {
+        return this.buf.length > 0;
+    }
+
+    finish() {
+        if (this.unwrap_mode && !this.closing_bracket_skipped) {
+            throw new RbqlJsonParsingError("Closing square bracket `]` at the end is required in unwrap mode");
+        }
+        if (!this.current.inside_string && this.current.bracket_stack.length === 0) {
+            this._consume_fragment(this.buf);
+            this.buf = '';
+        }
+    }
+
+    _consume_fragment(fragment) {
+        fragment = fragment.trim();
+        if (fragment.length > 0) {
+            try {
+                this.parsed_objects.push(JSON.parse(fragment));
+            } catch (e) {
+                throw new RbqlJsonParsingError(`Failed to deserialize a record after the first ${this.num_parsed} records: ${e}`);
+            }
+            this.num_parsed += 1;
+            this.current = new UnparsedJsonBlob();
+        }
+    }
+
+    skip_open_square_bracket(idx) {
+        while (idx < this.buf.length && isSpace(this.buf[idx])) {
+            idx += 1;
+        }
+        if (idx >= this.buf.length) {
+            return idx;
+        }
+        if (this.buf[idx] !== '[') {
+            throw new RbqlJsonParsingError(`Input data must be wrapped in JSON array in unwrap mode. Expected \`[\` got \`${this.buf[idx]}\` char`);
+        }
+        this.open_bracket_skipped = true;
+        return idx + 1;
+    }
+
+    skip_trailing_spaces(idx) {
+        while (idx < this.buf.length) {
+            if (isSpace(this.buf[idx])) {
+                idx += 1;
+                continue;
+            }
+            throw new RbqlJsonParsingError("Trailing data after the closing square bracket `]` in unwrap mode");
+        }
+        return idx;
+    }
+
+    _parse_forward(seek_start_pos) {
+        let i = seek_start_pos;
+        if (!this.open_bracket_skipped) {
+            i = this.skip_open_square_bracket(i);
+            this.buf = this.buf.slice(i);
+            i = 0;
+        }
+        while (i < this.buf.length) {
+            if (this.closing_bracket_skipped) {
+                this.skip_trailing_spaces(i);
+                return;
+            }
+            let object_can_end = false;
+            let end_offset = 0; // This is to be able to drop trailing `,` or `]` in the unwrap mode.
+            
+            if (this.current.inside_string) {
+                if (this.buf[i] === '"' && !this.current.backslash_escape_flag) {
+                    this.current.inside_string = false;
+                    // This is to handle a sequence of json strings like this `"str1""str2""str3"` - strings don't have to be separated with whitespaces.
+                    object_can_end = true;
+                }
+                if (this.buf[i] === backslashChar) {
+                    this.current.backslash_escape_flag = !this.current.backslash_escape_flag;
+                } else {
+                    // We don't check that the preceeding backslash cretes a valid escape sequence.
+                    // This allows invalid escape sequences inside strings e.g. "hello\ world" but it is fine since external parsing would catch it anyway.
+                    this.current.backslash_escape_flag = false;
+                }
+            } else if (this.buf[i] === '"') {
+                this.current.inside_string = true;
+                this.current.backslash_escape_flag = false; // Just in case although it is probably redundant since we would reset the flag anyway when finishing the previous string.
+            } else if (this.buf[i] === '{' || this.buf[i] === '[') {
+                this.current.bracket_stack.push(this.buf[i]);
+            } else if (this.buf[i] === '}') {
+                if (this.current.bracket_stack.length === 0 || this.current.bracket_stack.pop() !== '{') {
+                    throw new RbqlJsonParsingError(`Found an unbalanced closing curly bracket \`}\` after parsing the first ${this.num_parsed} records`);
+                }
+                object_can_end = true;
+            } else if (this.buf[i] === ']') {
+                if (this.unwrap_mode && this.current.bracket_stack.length === 0 && !this.closing_bracket_skipped) {
+                    this.closing_bracket_skipped = true;
+                    end_offset = 1;
+                } else if (this.current.bracket_stack.length === 0 || this.current.bracket_stack.pop() !== '[') {
+                    throw new RbqlJsonParsingError(`Found an unbalanced closing square bracket \`]\` after parsing the first ${this.num_parsed} records`);
+                }
+                object_can_end = true;
+            } else if (this.buf[i] === ',' && this.unwrap_mode) {
+                // TODO This would make a sequence of commas a valid noop span, consider fixing it.
+                end_offset = 1;
+                object_can_end = true;
+            } else if (isSpace(this.buf[i])) {
+                object_can_end = true;
+            }
+            
+            i += 1;
+            
+            if (object_can_end && this.current.bracket_stack.length === 0) {
+                const fragment = this.buf.slice(0, i - end_offset);
+                this.buf = this.buf.slice(i);
+                i = 0;
+                this._consume_fragment(fragment);
+            }
+        }
+    }
+}
+
+// Helper function mimicking Python's str.isspace() for single characters
+function isSpace(ch) {
+    return /\s/.test(ch);
+}
+
 
 class RbqlIOHandlingError extends Error {}
 
-
-// FIXME add bash-level unit tests for the cli tool that would use json format.
-// FIXME merge all iterators into a single one and all writers into one.
 
 function assert(condition, message=null) {
     if (!condition) {
@@ -64,9 +231,8 @@ function stringify_json_line_python_style(obj) {
 }
 
 
-class JsonArrayObjectWriter extends rbql.RBQLOutputWriter {
-    //FIXME add unit tests
-    constructor(stream, close_stream_on_finish, encoding='utf-8', line_separator='\n', pretty_indent=null, wrap_in_json_array=true) {
+class JsonWriter extends rbql.RBQLOutputWriter {
+    constructor(stream, close_stream_on_finish, encoding='utf-8', line_separator='\n', pretty_indent=null, wrap_into_array=false) {
         super();
         this.stream = stream;
         this.encoding = encoding;
@@ -82,7 +248,7 @@ class JsonArrayObjectWriter extends rbql.RBQLOutputWriter {
         this.first_error = null;
         this.num_records_written = 0;
         this.pretty_indent = pretty_indent;
-        this.wrap_in_json_array = wrap_in_json_array;
+        this.wrap_into_array = wrap_into_array;
     }
 
     store_first_error(error_obj) {
@@ -98,7 +264,7 @@ class JsonArrayObjectWriter extends rbql.RBQLOutputWriter {
     }
 
     async finish() {
-        if (this.wrap_in_json_array) {
+        if (this.wrap_into_array) {
             if (this.num_records_written == 0) {
                 // Output an empty array if no entries were produced.
                 this.stream.write('[');
@@ -140,16 +306,16 @@ class JsonArrayObjectWriter extends rbql.RBQLOutputWriter {
 
     async do_write(object_to_write) {
         if (this.num_records_written == 0) {
-            if (this.wrap_in_json_array) {
+            if (this.wrap_into_array) {
                 this.stream.write('[');
                 this.stream.write(this.line_separator);
             }
         } else {
-            this.stream.write(',');
+            if (this.wrap_into_array) {
+                this.stream.write(',');
+            }
             this.stream.write(this.line_separator);
         }
-        // FIXME add unit tests for pretty mode
-        // FIXME add integration test for pretty mode, both js and python
         if (this.pretty_indent === null) {
             this.stream.write(stringify_json_line_python_style(object_to_write));
         } else {
@@ -174,250 +340,19 @@ class JsonArrayObjectWriter extends rbql.RBQLOutputWriter {
         // This writer always succeeds (unless there is an exception).
         return true;
     };
-}
 
-class JsonLinesWriter extends rbql.RBQLOutputWriter {
-    constructor(stream, close_stream_on_finish, encoding='utf-8', line_separator='\n') {
-        super();
-        this.stream = stream;
-        this.encoding = encoding;
-        if (encoding)
-            this.stream.setDefaultEncoding(encoding);
-        this.stream.on('error', (error_obj) => { this.store_first_error(error_obj); })
-        this.line_separator = line_separator;
-
-        this.close_stream_on_finish = close_stream_on_finish;
-
-        this.header = [];
-        this.deduplicated_keys = [];
-        this.first_error = null;
-    }
-
-    store_first_error(error_obj) {
-        // Store only first error because it is typically more important than the subsequent ones.
-        if (this.first_error === null)
-            this.first_error = error_obj;
-    }
-
-    set_header(header) {
-        if (header !== null) {
-            [this.header, this.deduplicated_keys] = deduplicate_header_keys(header);
+    handle_query_modifier(modifier) {
+        if (modifier == 'wrap') {
+            assert(this.num_records_written == 0)
+            this.wrap_into_array = true;
         }
     }
-
-    async finish() {
-        let close_stream_on_finish = this.close_stream_on_finish;
-        let output_stream = this.stream;
-        let output_encoding = this.encoding;
-        let writer_error = this.first_error;
-        let finish_promise = new Promise(function(resolve, reject) {
-            if (writer_error !== null) {
-                reject(writer_error);
-            }
-            if (close_stream_on_finish) {
-                output_stream.end('', output_encoding, () => { resolve(); });
-            } else {
-                setTimeout(() => { resolve(); }, 0);
-            }
-        });
-        return finish_promise;
-    };
-
-
-    get_warnings() {
-        let result = [];
-        if (this.deduplicated_keys.length > 0) {
-            let keys_to_report = this.deduplicated_keys.map(key => `"${key}"`).join(', ');
-            result.push(`Deduplicated output json keys to avoid data loss: ${keys_to_report}`);
-        }
-        return result;
-    };
-
-
-    async do_write(object_to_write) {
-        this.stream.write(stringify_json_line_python_style(object_to_write));
-        this.stream.write(this.line_separator);
-        let writer_error = this.first_error;
-        return new Promise(function(resolve, reject) {
-            if (writer_error !== null) {
-                reject(writer_error);
-            } else {
-                resolve();
-            }
-        });
-    }
-
-
-    async write(fields) {
-        let object_to_write = get_json_object_to_write(this.header, fields);
-        await this.do_write(object_to_write);
-        // The return value is needed for the stacked writers architecture in rbql.js.
-        // So far the only writer that can return `false` is the TopWriter which uses it as a flag to request stop when the limit is reached.
-        // This writer always succeeds (unless there is an exception).
-        return true;
-    };
 }
 
 
-class JsonArrayObjectRecordIterator extends rbql.RBQLInputIterator {
-    // TODO we can optimize this to process objects as they arrive if we have implementation for json-batches parser.
-    // Json array would be almost similar format except that we have array object at root which can be easily skipped.
-    // Another difference between this format and json batches would be commas at the end of each object but they can also be easily skipped.
-    constructor(stream, encoding='utf-8', table_name='input', variable_prefix='a') {
-        super();
-        this.stream = stream;
-        this.encoding = encoding;
-        this.table_name = table_name;
-        this.variable_prefix = variable_prefix;
-
-
-        this.decoder = null;
-        if (encoding == 'utf-8') {
-            // This was copied from the csv impl, see comments there.
-            this.decoder = new util.TextDecoder(encoding, {fatal: true, stream: true});
-        }
-
-        this.input_exhausted = false;
-        this.started = false;
-
-        // Holds an external "resolve" function which is called when everything is fine.
-        this.resolve_current_record = null;
-        // Holds an external "reject" function which is called when error has occured.
-        this.reject_current_record = null;
-        // Holds last exception if we don't have any reject callbacks from clients yet.
-        this.current_exception = null;
-
-        this.produced_records_queue = new csv_utils.RecordQueue();
-        this.record_number = 0;
-        this.input_data_chunks = [];
-    }
-
-    get_header() {
-        // Returning "a1" as a column name actually has a side effect because it would try to initialize a.a1 and a['a1'] values in rbql engine.
-        return [this.variable_prefix];
-    }
-
-    reset_external_callbacks() {
-        // Drop external callbacks simultaneously since promises can only resolve once, see: https://stackoverflow.com/a/18218542/2898283
-        this.reject_current_record = null;
-        this.resolve_current_record = null;
-    }
-
-    try_propagate_exception() {
-        if (this.current_exception && this.reject_current_record) {
-            let reject = this.reject_current_record;
-            let exception = this.current_exception;
-            this.reset_external_callbacks();
-            this.current_exception = null;
-            reject(exception);
-        }
-    }
-
-
-    store_or_propagate_exception(exception) {
-        if (this.current_exception === null)
-            // Ignore subsequent exceptions if we already have an unreported error. This way we prioritize earlier errors over the more recent ones.
-            this.current_exception = exception;
-        this.try_propagate_exception();
-    }
-
-
-    try_resolve_next_record() {
-        this.try_propagate_exception();
-        if (this.resolve_current_record === null)
-            return;
-
-        let record = this.produced_records_queue.dequeue();
-        if (record === null && !this.input_exhausted)
-            return;
-        let resolve = this.resolve_current_record;
-        this.reset_external_callbacks();
-        this.record_number += 1;
-        resolve(record);
-    };
-
-
-    async get_record() {
-        if (!this.started)
-            await this.start();
-        if (this.stream && this.stream.isPaused())
-            this.stream.resume();
-
-        let parent_iterator = this;
-        let current_record_promise = new Promise(function(resolve, reject) {
-            parent_iterator.resolve_current_record = resolve;
-            parent_iterator.reject_current_record = reject;
-        });
-        this.try_resolve_next_record();
-        return current_record_promise;
-    };
-
-
-    process_data_stream_chunk(data_chunk) {
-        let decoded_string = null;
-        if (this.decoder) {
-            try {
-                decoded_string = this.decoder.decode(data_chunk);
-            } catch (e) {
-                if (e instanceof TypeError) {
-                    this.store_or_propagate_exception(new RbqlIOHandlingError(utf_decoding_error));
-                } else {
-                    this.store_or_propagate_exception(e);
-                }
-                return;
-            }
-        } else {
-            decoded_string = data_chunk.toString(this.encoding);
-        }
-        this.input_data_chunks.push(decoded_string);
-    };
-
-
-    process_data_stream_end() {
-        this.input_exhausted = true;
-        let input_data_string = this.input_data_chunks.join('');
-        let json_object = null;
-        try {
-            json_object = JSON.parse(input_data_string);
-        } catch (e) {
-            if (e instanceof SyntaxError) {
-                this.store_or_propagate_exception(new RbqlIOHandlingError(`Unable to parse input stream as JSON: ${e.message}`));
-            } else {
-                this.store_or_propagate_exception(e);
-            }
-            return;
-        }
-        if (!Array.isArray(json_object)) {
-            this.store_or_propagate_exception(new RbqlIOHandlingError("Input JSON root node must be array in array iteration mode"));
-            return;
-        }
-        for (let record of json_object) {
-            this.produced_records_queue.enqueue([record]);
-        }
-        this.try_resolve_next_record();
-    };
-
-
-    stop() {
-        if (this.stream)
-            this.stream.destroy(); // TODO consider using pause() instead
-    };
-
-
-    async start() {
-        if (this.started)
-            return;
-        this.started = true;
-        this.stream.on('data', (data_chunk) => { this.process_data_stream_chunk(data_chunk); });
-        this.stream.on('end', () => { this.process_data_stream_end(); });
-    };
-}
-
-
-class JsonLinesRecordIterator extends rbql.RBQLInputIterator {
+class JsonIterator extends rbql.RBQLInputIterator {
     // TODO add query modifier with "noheaders" this would name keys as `a1`, `a2`, etc.
-    // FIXME add unit tests
-    constructor(stream, encoding='utf-8', table_name='input', variable_prefix='a') {
+    constructor(stream, unwrap_mode=false, encoding='utf-8', table_name='input', variable_prefix='a') {
         super();
         this.stream = stream;
         this.encoding = encoding;
@@ -434,12 +369,6 @@ class JsonLinesRecordIterator extends rbql.RBQLInputIterator {
         this.input_exhausted = false;
         this.started = false;
 
-        this.record_number = 0;
-        this.line_number = 0;
-
-        this.partially_decoded_line = '';
-        this.partially_decoded_line_ends_with_cr = false;
-
         // Holds an external "resolve" function which is called when everything is fine.
         this.resolve_current_record = null;
         // Holds an external "reject" function which is called when error has occured.
@@ -447,6 +376,7 @@ class JsonLinesRecordIterator extends rbql.RBQLInputIterator {
         // Holds last exception if we don't have any reject callbacks from clients yet.
         this.current_exception = null;
 
+        this.balancing_iterator = new BalancingIterator(unwrap_mode);
         this.produced_records_queue = new csv_utils.RecordQueue();
     }
 
@@ -509,220 +439,32 @@ class JsonLinesRecordIterator extends rbql.RBQLInputIterator {
         return current_record_promise;
     };
 
-
-    process_record_line(line) {
-        this.record_number += 1;
+    process_data_stream_chunk(data_chunk) {
+        let decoded_string = null;
+        if (this.decoder) {
+            try {
+                decoded_string = this.decoder.decode(data_chunk);
+            } catch (e) {
+                if (e instanceof TypeError) {
+                    this.store_or_propagate_exception(new RbqlIOHandlingError(utf_decoding_error));
+                } else {
+                    this.store_or_propagate_exception(e);
+                }
+                return;
+            }
+        } else {
+            decoded_string = data_chunk.toString(this.encoding);
+        }
         try {
-            this.produced_records_queue.enqueue([JSON.parse(line)]);
+            this.balancing_iterator.add_fragment(decoded_string);
         } catch (e) {
-            if (e instanceof SyntaxError) {
-                this.store_or_propagate_exception(new RbqlIOHandlingError(`Error in line: ${this.line_number} Unable to parse "${line} as JSON: ${e.message}"`));
-            } else {
+            this.store_or_propagate_exception(e);
+        }
+        while (!this.balancing_iterator.empty()) {
+            try {
+                this.produced_records_queue.enqueue([this.balancing_iterator.advance()]);
+            } catch (e) {
                 this.store_or_propagate_exception(e);
-            }
-            return;
-        }
-        this.try_resolve_next_record();
-    };
-
-
-    process_line(line) {
-        this.line_number += 1;
-        this.process_record_line(line);
-    };
-
-
-    process_data_stream_chunk(data_chunk) {
-        let decoded_string = null;
-        if (this.decoder) {
-            try {
-                decoded_string = this.decoder.decode(data_chunk);
-            } catch (e) {
-                if (e instanceof TypeError) {
-                    this.store_or_propagate_exception(new RbqlIOHandlingError(utf_decoding_error));
-                } else {
-                    this.store_or_propagate_exception(e);
-                }
-                return;
-            }
-        } else {
-            decoded_string = data_chunk.toString(this.encoding);
-        }
-        let line_starts_with_lf = decoded_string.length && decoded_string[0] == '\n';
-        let first_line_index = line_starts_with_lf && this.partially_decoded_line_ends_with_cr ? 1 : 0;
-        this.partially_decoded_line_ends_with_cr = decoded_string.length && decoded_string[decoded_string.length - 1] == '\r';
-        let lines = csv_utils.split_lines(decoded_string);
-        lines[0] = this.partially_decoded_line + lines[0];
-        assert(first_line_index == 0 || lines[0].length == 0);
-        this.partially_decoded_line = lines.pop();
-        for (let i = first_line_index; i < lines.length; i++) {
-            this.process_line(lines[i]);
-        }
-    };
-
-
-    process_data_stream_end() {
-        this.input_exhausted = true;
-        if (this.partially_decoded_line.length) {
-            let last_line = this.partially_decoded_line;
-            this.partially_decoded_line = '';
-            this.process_line(last_line);
-        }
-        this.try_resolve_next_record();
-    };
-
-
-    stop() {
-        if (this.stream)
-            this.stream.destroy(); // TODO consider using pause() instead
-    };
-
-
-    async start() {
-        if (this.started)
-            return;
-        this.started = true;
-        this.stream.on('data', (data_chunk) => { this.process_data_stream_chunk(data_chunk); });
-        this.stream.on('end', () => { this.process_data_stream_end(); });
-    };
-}
-
-
-class JsonStreamRecordIterator extends rbql.RBQLInputIterator {
-    // TODO add query modifier with "noheaders" this would name keys as `a1`, `a2`, etc.
-    // FIXME add unit tests
-    constructor(stream, encoding='utf-8', table_name='input', variable_prefix='a') {
-        super();
-        this.stream = stream;
-        this.encoding = encoding;
-        this.table_name = table_name;
-        this.variable_prefix = variable_prefix;
-
-
-        this.decoder = null;
-        if (encoding == 'utf-8') {
-            // This was copied from the csv impl, see comments there.
-            this.decoder = new util.TextDecoder(encoding, {fatal: true, stream: true});
-        }
-
-        this.input_exhausted = false;
-        this.started = false;
-
-        this.record_number = 0;
-        this.line_number = 0;
-
-        this.partially_decoded_line = '';
-        this.partially_decoded_line_ends_with_cr = false;
-
-        // Holds an external "resolve" function which is called when everything is fine.
-        this.resolve_current_record = null;
-        // Holds an external "reject" function which is called when error has occured.
-        this.reject_current_record = null;
-        // Holds last exception if we don't have any reject callbacks from clients yet.
-        this.current_exception = null;
-
-        this.json_finalizer = new json_utils.JsonFinalizer();
-        this.produced_records_queue = new csv_utils.RecordQueue();
-    }
-
-    get_header() {
-        // Returning "a1" as a column name actually has a side effect because it would try to initialize a.a1 and a['a1'] values in rbql engine.
-        return [this.variable_prefix];
-    }
-
-    reset_external_callbacks() {
-        // Drop external callbacks simultaneously since promises can only resolve once, see: https://stackoverflow.com/a/18218542/2898283
-        this.reject_current_record = null;
-        this.resolve_current_record = null;
-    }
-
-    try_propagate_exception() {
-        if (this.current_exception && this.reject_current_record) {
-            let reject = this.reject_current_record;
-            let exception = this.current_exception;
-            this.reset_external_callbacks();
-            this.current_exception = null;
-            reject(exception);
-        }
-    }
-
-
-    store_or_propagate_exception(exception) {
-        if (this.current_exception === null)
-            // Ignore subsequent exceptions if we already have an unreported error. This way we prioritize earlier errors over the more recent ones.
-            this.current_exception = exception;
-        this.try_propagate_exception();
-    }
-
-
-    try_resolve_next_record() {
-        this.try_propagate_exception();
-        if (this.resolve_current_record === null)
-            return;
-
-        let record = this.produced_records_queue.dequeue();
-        if (record === null && !this.input_exhausted)
-            return;
-        let resolve = this.resolve_current_record;
-        this.reset_external_callbacks();
-        resolve(record);
-    };
-
-
-    async get_record() {
-        if (!this.started)
-            await this.start();
-        if (this.stream && this.stream.isPaused())
-            this.stream.resume();
-
-        let parent_iterator = this;
-        let current_record_promise = new Promise(function(resolve, reject) {
-            parent_iterator.resolve_current_record = resolve;
-            parent_iterator.reject_current_record = reject;
-        });
-        this.try_resolve_next_record();
-        return current_record_promise;
-    };
-
-    process_data_stream_chunk(data_chunk) {
-        let decoded_string = null;
-        if (this.decoder) {
-            try {
-                decoded_string = this.decoder.decode(data_chunk);
-            } catch (e) {
-                if (e instanceof TypeError) {
-                    this.store_or_propagate_exception(new RbqlIOHandlingError(utf_decoding_error));
-                } else {
-                    this.store_or_propagate_exception(e);
-                }
-                return;
-            }
-        } else {
-            decoded_string = data_chunk.toString(this.encoding);
-        }
-        this.json_finalizer.add_data(decoded_string);
-        while (true) {
-            let object_text = null;
-            try {
-                object_text = this.json_finalizer.get_first_object();
-            } catch (e) {
-                this.store_or_propagate_exception(new RbqlIOHandlingError(`Unable to interpret data as JSON (record number ${this.record_number}): ${e.message}"`));
-            }
-            if (object_text === null) {
-                // This means that there is no completed objects in the finalizer.
-                break;
-            }
-            this.json_finalizer.erase_first_object();
-            try {
-                this.produced_records_queue.enqueue([JSON.parse(object_text)]);
-                this.record_number += 1;
-            } catch (e) {
-                if (e instanceof SyntaxError) {
-                    // FIXME ut this
-                    this.store_or_propagate_exception(new RbqlIOHandlingError(`Unable to parse data as JSON (record number ${this.record_number}): ${e.message}"`));
-                } else {
-                    this.store_or_propagate_exception(e);
-                }
                 return;
             }
             this.try_resolve_next_record();
@@ -732,7 +474,12 @@ class JsonStreamRecordIterator extends rbql.RBQLInputIterator {
 
     process_data_stream_end() {
         this.input_exhausted = true;
-        if (!this.json_finalizer.is_empty()) {
+        try {
+            this.balancing_iterator.finish();
+        } catch (e) {
+            this.store_or_propagate_exception(e);
+        }
+        if (this.balancing_iterator.has_trailing_data()) {
             this.store_or_propagate_exception(new RbqlIOHandlingError(`Trailing data in ${this.table_name} stream that can't be parsed as JSON objects`));
         }
         // This last call is needed so that null is dequeued from the queue which initiaties the query completion.
@@ -753,9 +500,20 @@ class JsonStreamRecordIterator extends rbql.RBQLInputIterator {
         this.stream.on('data', (data_chunk) => { this.process_data_stream_chunk(data_chunk); });
         this.stream.on('end', () => { this.process_data_stream_end(); });
     };
+
+    handle_query_modifier(modifier) {
+        if (modifier == 'unwrap') {
+            assert(!this.started)
+            this.balancing_iterator = new BalancingIterator(/*unwrap_mode=*/true);
+        }
+    }
 }
 
-async function query_json(query_text, input_path, output_path, output_warnings, user_init_code='', input_json_lines=true, output_json_lines=true, pretty_indent=null, input_json_stream=false, output_json_stream=false) {
+async function query_json(query_text, input_path, output_path, output_warnings, params) {
+    let user_init_code = params.hasOwnProperty('user_init_code') ? params['user_init_code'] : '';
+    let pretty_indent = params.hasOwnProperty('pretty_indent') ? params['pretty_indent'] : null;
+    let unwrap_array = params.hasOwnProperty('unwrap_array') ? params['unwrap_array'] : false;
+    let wrap_into_array = params.hasOwnProperty('wrap_into_array') ? params['wrap_into_array'] : false;
     let input_stream = input_path === null ? process.stdin : fs.createReadStream(input_path);
     let [output_stream, close_output_on_finish] = output_path === null ? [process.stdout, false] : [fs.createWriteStream(output_path), true];
 
@@ -766,23 +524,8 @@ async function query_json(query_text, input_path, output_path, output_warnings, 
     let input_file_dir = input_path ? path.dirname(input_path) : null;
     let join_tables_registry = null;
 
-    let input_iterator = null;
-    if (input_json_lines) {
-        input_iterator = new JsonLinesRecordIterator(input_stream);
-    } else if (input_json_stream) {
-        input_iterator = new JsonStreamRecordIterator(input_stream);
-    } else {
-        input_iterator = new JsonArrayObjectRecordIterator(input_stream);
-    }
-
-    let output_writer = null;
-    if (output_json_lines) {
-        output_writer = new JsonLinesWriter(output_stream, close_output_on_finish);
-    } else if (output_json_stream) {
-        output_writer = new JsonArrayObjectWriter(output_stream, close_output_on_finish, 'utf-8', '\n', pretty_indent, /*wrap_in_json_array=*/false);
-    } else {
-        output_writer = new JsonArrayObjectWriter(output_stream, close_output_on_finish, 'utf-8', '\n', pretty_indent);
-    }
+    let input_iterator = new JsonIterator(input_stream, unwrap_array);
+    let output_writer = new JsonWriter(output_stream, close_output_on_finish, 'utf-8', '\n', /*pretty_indent=*/pretty_indent, /*wrap_into_array=*/wrap_into_array);
 
     await rbql.query(query_text, input_iterator, output_writer, output_warnings, join_tables_registry, user_init_code);
 }
@@ -791,8 +534,7 @@ async function query_json(query_text, input_path, output_path, output_warnings, 
 module.exports.deduplicate_header_keys = deduplicate_header_keys;
 module.exports.stringify_json_line_python_style = stringify_json_line_python_style;
 module.exports.get_json_object_to_write = get_json_object_to_write;
-module.exports.JsonLinesWriter = JsonLinesWriter;
-module.exports.JsonArrayObjectWriter = JsonArrayObjectWriter;
-module.exports.JsonLinesRecordIterator = JsonLinesRecordIterator;
-module.exports.JsonStreamRecordIterator = JsonStreamRecordIterator;
+module.exports.JsonWriter = JsonWriter;
+module.exports.JsonIterator = JsonIterator;
+module.exports.BalancingIterator = BalancingIterator;
 module.exports.query_json = query_json;
