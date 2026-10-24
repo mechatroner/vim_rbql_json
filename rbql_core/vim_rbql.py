@@ -59,7 +59,7 @@ def execute_python(src_table_path, rb_script_path, dst_table_path, pretty_indent
     logging.info('Starting query: "{}"'.format(query))
     warnings = []
     try:
-        rbql.query_json(query, src_table_path, dst_table_path, warnings, pretty_indent=pretty_indent, input_json_lines=False, output_json_lines=False, input_json_stream=True, output_json_stream=True)
+        rbql.query_json(query, src_table_path, dst_table_path, warnings, pretty_indent=pretty_indent)
         warning_report = '\n'.join(warnings)
         vim_interface.set_vim_variable('psv_warning_report', warning_report)
         vim_interface.set_vim_variable('psv_query_status', 'OK')
